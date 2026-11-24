@@ -12,7 +12,7 @@
 //! - [`adversarial_amounts`], [`amounts_in`], [`bps_values`], and
 //!   [`Conservation`] from `money`
 //! - [`TestToken`] from `tokens`
-//! - [`StorageKind`] from `ttl`
+//! - [`ExpiryContext`] and [`StorageKind`] from `ttl`
 //!
 //! Use the prelude when a test needs several of these items, or when a
 //! single import keeps the test focused on behavior. Prefer a
@@ -89,4 +89,4 @@ pub use crate::core::{TestEnv, TestkitError};
 pub use crate::events::{CapturedEvent, EventLog};
 pub use crate::money::{adversarial_amounts, amounts_in, bps_values, Conservation};
 pub use crate::tokens::TestToken;
-pub use crate::ttl::StorageKind;
+pub use crate::ttl::{ExpiryContext, StorageKind};
