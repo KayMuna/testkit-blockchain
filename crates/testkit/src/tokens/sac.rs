@@ -6,12 +6,22 @@ use soroban_sdk::{Address, Env, IntoVal};
 
 use crate::core::{TestEnv, TestkitError};
 
-/// The decimal precision every Stellar Asset Contract uses. This is fixed
-/// by the protocol (the classic Stellar asset precision), not something a
-/// deployer can choose — verified against soroban-sdk 27.0.6:
+/// The decimal precision every Stellar Asset Contract uses.
+///
+/// This is fixed by the protocol (the classic Stellar asset precision), not
+/// something a deployer can choose. Verified against soroban-sdk 27.0.6:
 /// `register_stellar_asset_contract_v2` takes no decimals parameter, and a
 /// freshly deployed SAC's own `decimals()` always returns 7.
-const SAC_DECIMALS: u32 = 7;
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::prelude::*;
+///
+/// let env = TestEnv::new();
+/// assert_eq!(env.token().decimals(), SAC_DECIMALS);
+/// ```
+pub const SAC_DECIMALS: u32 = 7;
 
 /// A deployed Stellar Asset Contract test double, with one-line mint/balance
 /// helpers so tests don't hand-roll SAC setup boilerplate.
@@ -33,6 +43,19 @@ impl TestToken {
         }
     }
 
+    /// The admin address this token was registered with.
+    ///
+    /// Use this when composing auth expectations, e.g. for `mint`,
+    /// `set_authorized`, or `set_admin`, which require the admin's auth.
+    pub fn admin(&self) -> &Address {
+        &self.admin
+    }
+
+    /// The admin address as an owned value, for APIs that take `Address` by value.
+    pub fn admin_address(&self) -> Address {
+        self.admin.clone()
+    }
+
     /// The token contract's address.
     pub fn address(&self) -> Address {
         self.address.clone()
@@ -46,11 +69,17 @@ impl TestToken {
     /// Mint `amount` **whole units** to `to` (converted internally to base
     /// units, i.e. `amount * 10^decimals`).
     ///
+    /// A zero `amount` is allowed and changes nothing (see
+    /// [`TestToken::mint_raw`]).
+    ///
+    /// The largest whole-unit amount that converts safely is
+    /// `i128::MAX / 10^decimals`.
+    ///
     /// # Panics
     ///
-    /// Panics with a [`TestkitError::Misuse`] if the conversion to base
-    /// units would overflow `i128`; use [`TestToken::mint_raw`] for amounts
-    /// already in base units.
+    /// Panics with a [`TestkitError::Misuse`] if `amount` is negative, or if
+    /// the conversion to base units would overflow `i128`; use
+    /// [`TestToken::mint_raw`] for amounts already in base units.
     ///
     /// # Example
     ///
@@ -65,6 +94,14 @@ impl TestToken {
     /// token.assert_balance(&alice, 1_000_000_000); // 100 * 10^7
     /// ```
     pub fn mint(&self, to: &Address, amount: i128) {
+        if amount < 0 {
+            panic!(
+                "{}",
+                TestkitError::Misuse(format!(
+                    "mint({amount}) is negative; a mint amount must be zero or positive"
+                ))
+            );
+        }
         let scale = 10i128.pow(self.decimals());
         let raw = amount.checked_mul(scale).unwrap_or_else(|| {
             panic!(
@@ -82,6 +119,17 @@ impl TestToken {
     /// Mint `amount` **base units** (stroops) to `to`, with no unit
     /// conversion.
     ///
+    /// A zero `amount` is allowed: the Stellar Asset Contract accepts a zero
+    /// mint as a no-op, so balances and [`TestToken::total_tracked`] stay as
+    /// they were. A negative `amount` is rejected before the token host is
+    /// invoked.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`TestkitError::Misuse`] if `amount` is negative, or if
+    /// adding it to [`TestToken::total_tracked`] would overflow `i128`. In
+    /// both cases nothing is minted and the tracked total is unchanged.
+    ///
     /// # Example
     ///
     /// ```
@@ -95,6 +143,31 @@ impl TestToken {
     /// token.assert_balance(&alice, 42);
     /// ```
     pub fn mint_raw(&self, to: &Address, amount: i128) {
+        if amount < 0 {
+            panic!(
+                "{}",
+                TestkitError::Misuse(format!(
+                    "mint_raw({amount}) is negative; a mint amount must be zero or positive"
+                ))
+            );
+        }
+        // Work out the new tracked total first, so an overflow is reported
+        // before anything is minted and the token and the tracker never
+        // disagree.
+        let new_total = self
+            .total_tracked
+            .get()
+            .checked_add(amount)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}",
+                    TestkitError::Misuse(format!(
+                    "mint_raw({amount}) would overflow total_tracked (currently {}); the sum of \
+                     all mints must stay within i128::MAX",
+                    self.total_tracked.get()
+                ))
+                )
+            });
         StellarAssetClient::new(&self.env, &self.address)
             .mock_auths(&[MockAuth {
                 address: &self.admin,
@@ -106,7 +179,7 @@ impl TestToken {
                 },
             }])
             .mint(to, &amount);
-        self.total_tracked.set(self.total_tracked.get() + amount);
+        self.total_tracked.set(new_total);
     }
 
     /// The base-unit balance of `of`.
@@ -283,6 +356,111 @@ mod tests {
         token.mint_raw(&env.address(), 10);
         token.mint(&env.address(), 1);
         assert_eq!(token.total_tracked(), 10 + 10i128.pow(7));
+    }
+
+    // ── Mint edge cases (#90, #92, #94, #97) ────────────────────────────────
+
+    #[test]
+    fn zero_mint_leaves_balance_and_tracked_supply_unchanged() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+
+        token.mint_raw(&alice, 0);
+        token.assert_balance(&alice, 0);
+        assert_eq!(token.total_tracked(), 0);
+
+        token.mint(&alice, 0);
+        token.assert_balance(&alice, 0);
+        assert_eq!(token.total_tracked(), 0);
+
+        // A zero mint after a real one changes nothing either.
+        token.mint_raw(&alice, 25);
+        token.mint_raw(&alice, 0);
+        token.assert_balance(&alice, 25);
+        assert_eq!(token.total_tracked(), 25);
+    }
+
+    #[test]
+    #[should_panic(expected = "mint_raw(-1) is negative")]
+    fn mint_raw_rejects_a_negative_amount() {
+        let env = TestEnv::new();
+        env.token().mint_raw(&env.address(), -1);
+    }
+
+    #[test]
+    fn rejected_negative_mint_raw_does_not_change_tracked_supply() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, 10);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.mint_raw(&alice, -5);
+        }));
+        assert!(result.is_err());
+        token.assert_balance(&alice, 10);
+        assert_eq!(token.total_tracked(), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "mint(-3) is negative")]
+    fn mint_rejects_a_negative_whole_unit_amount() {
+        let env = TestEnv::new();
+        env.token().mint(&env.address(), -3);
+    }
+
+    #[test]
+    fn mint_accepts_the_largest_safe_whole_unit_amount() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let largest = i128::MAX / 10i128.pow(7);
+
+        token.mint(&alice, largest);
+        token.assert_balance(&alice, largest * 10i128.pow(7));
+        assert_eq!(token.total_tracked(), largest * 10i128.pow(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows i128 once converted to base units")]
+    fn mint_rejects_one_whole_unit_past_the_largest_safe_amount() {
+        let env = TestEnv::new();
+        let past = i128::MAX / 10i128.pow(7) + 1;
+        env.token().mint(&env.address(), past);
+    }
+
+    #[test]
+    #[should_panic(expected = "would overflow total_tracked")]
+    fn total_tracked_overflow_is_reported_not_wrapped() {
+        let env = TestEnv::new();
+        let token = env.token();
+        token.mint_raw(&env.address(), i128::MAX);
+        token.mint_raw(&env.address(), 1);
+    }
+
+    #[test]
+    fn total_tracked_can_reach_i128_max_exactly() {
+        let env = TestEnv::new();
+        let token = env.token();
+        token.mint_raw(&env.address(), i128::MAX - 5);
+        token.mint_raw(&env.address(), 5);
+        assert_eq!(token.total_tracked(), i128::MAX);
+    }
+
+    #[test]
+    fn overflowing_mint_leaves_tracked_supply_and_balance_untouched() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, i128::MAX - 1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.mint_raw(&alice, 2);
+        }));
+        assert!(result.is_err());
+        assert_eq!(token.total_tracked(), i128::MAX - 1);
+        token.assert_balance(&alice, i128::MAX - 1);
     }
 
     #[contract]

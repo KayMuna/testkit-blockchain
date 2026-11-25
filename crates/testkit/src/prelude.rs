@@ -84,9 +84,9 @@
 //! let _kind = StorageKind::Instance;
 //! ```
 
-pub use crate::auth::AuthMatrix;
+pub use crate::auth::{AuthMatrix, MatrixCell, MatrixReport};
 pub use crate::core::{TestEnv, TestkitError};
 pub use crate::events::{CapturedEvent, EventLog};
 pub use crate::money::{adversarial_amounts, amounts_in, bps_values, Conservation};
-pub use crate::tokens::TestToken;
-pub use crate::ttl::{ExpiryContext, StorageKind};
+pub use crate::tokens::{TestToken, SAC_DECIMALS};
+pub use crate::ttl::StorageKind;
